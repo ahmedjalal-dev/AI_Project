@@ -1,5 +1,6 @@
 import random
 import math
+from concurrent.futures import ProcessPoolExecutor
 
 # ---------------------------
 # Load TSPLIB
@@ -21,74 +22,146 @@ def load_tsp(filename):
 
 
 # ---------------------------
-# Distance
+# Flat Distance Matrix
 # ---------------------------
-def distance(a, b):
-    return int(round(math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)))
+def build_dist_matrix(cities):
+    n = len(cities)
+    dist = [0] * (n * n)
+    for i in range(n):
+        xi, yi = cities[i]
+        for j in range(n):
+            dx = xi - cities[j][0]
+            dy = yi - cities[j][1]
+            dist[i*n + j] = int(round(math.sqrt(dx*dx + dy*dy)))
+    return dist
 
 
-def total_distance(route, cities):
-    return sum(distance(cities[route[i]], cities[route[(i+1) % len(route)]])
-               for i in range(len(route)))
+def total_distance(route, dist, n):
+    total = 0
+    for i in range(n - 1):
+        total += dist[route[i]*n + route[i+1]]
+    total += dist[route[-1]*n + route[0]]
+    return total
 
 
 # ---------------------------
-# 2-OPT
+# Candidate List (IMPORTANT)
 # ---------------------------
-def two_opt(route, cities):
+def build_candidates(dist, n, k=20):
+    candidates = []
+    for i in range(n):
+        neighbors = sorted(range(n), key=lambda j: dist[i*n + j])
+        candidates.append(neighbors[1:k+1])
+    return candidates
+
+
+# ---------------------------
+# OPTIMIZED 2-OPT
+# ---------------------------
+def two_opt(route, dist, n, candidates):
     best = route[:]
-    best_dist = total_distance(best, cities)
-    n = len(route)
+    best_dist = total_distance(best, dist, n)
+
+    # position lookup
+    pos = [0] * n
+    for i, city in enumerate(best):
+        pos[city] = i
 
     improved = True
     while improved:
         improved = False
-        for i in range(n - 1):
-            for j in range(i + 2, n):
-                if j - i == 1:
+
+        for i in range(n):
+            b = best[i]
+            a = best[i-1]
+
+            for c in candidates[b]:
+                j = pos[c]
+                d = best[(j+1) % n]
+
+                if i == j or (i+1) % n == j:
                     continue
 
-                new_route = best[:]
-                new_route[i:j] = reversed(new_route[i:j])
+                # delta evaluation
+                old = dist[a*n + b] + dist[c*n + d]
+                new = dist[a*n + c] + dist[b*n + d]
 
-                new_dist = total_distance(new_route, cities)
+                if new >= old:
+                    continue
 
-                if new_dist < best_dist:
+                # apply reversal
+                if i < j:
+                    best[i:j+1] = reversed(best[i:j+1])
+                    segment = best[i:j+1]
+                    for idx, city in enumerate(segment, start=i):
+                        pos[city] = idx
+                else:
+                    temp = best[i:] + best[:j+1]
+                    temp.reverse()
+                    new_route = temp[-(j+1):] + best[j+1:i] + temp[:-(j+1)]
                     best = new_route
-                    best_dist = new_dist
-                    improved = True
-                    break
+
+                    for idx, city in enumerate(best):
+                        pos[city] = idx
+
+                best_dist += (new - old)
+                improved = True
+                break
+
             if improved:
                 break
 
-    return best
+    return best, best_dist
 
 
 # ---------------------------
-# Crossover
+# Parallel init worker
 # ---------------------------
-def crossover(p1, p2, cities):
-    n = len(p1)
+def init_worker(args):
+    n, dist, candidates = args
+    r = random.sample(range(n), n)
+    return two_opt(r, dist, n, candidates)
+
+
+# ---------------------------
+# Crossover (unchanged)
+# ---------------------------
+def crossover(p1, p2, dist, n):
+    pos1 = {city: i for i, city in enumerate(p1)}
+    pos2 = {city: i for i, city in enumerate(p2)}
+
     start = random.choice(p1)
-
     child = [start]
-    visited = set(child)
-
+    visited = {start}
     current = start
+
     while len(child) < n:
-        idx1 = p1.index(current)
-        idx2 = p2.index(current)
+        idx1 = pos1[current]
+        idx2 = pos2[current]
 
-        n1 = [p1[(idx1-1)%n], p1[(idx1+1)%n]]
-        n2 = [p2[(idx2-1)%n], p2[(idx2+1)%n]]
+        n1 = (p1[(idx1-1)%n], p1[(idx1+1)%n])
+        n2 = (p2[(idx2-1)%n], p2[(idx2+1)%n])
 
-        common = [c for c in n1 if c in n2 and c not in visited]
+        found = None
+        for c in n1:
+            if c in n2 and c not in visited:
+                found = c
+                break
 
-        if common:
-            next_city = common[0]
+        if found is not None:
+            next_city = found
         else:
-            remaining = [c for c in p1 if c not in visited]
-            next_city = min(remaining, key=lambda c: distance(cities[current], cities[c]))
+            best_city = None
+            best_dist = 10**12
+
+            for c in p1:
+                if c not in visited:
+                    d = dist[current*n + c]
+                    if d < best_dist:
+                        best_dist = d
+                        best_city = c
+
+            next_city = best_city
 
         child.append(next_city)
         visited.add(next_city)
@@ -104,31 +177,47 @@ def mutate(route, rate=0.05):
     if random.random() < rate:
         i, j = random.sample(range(len(route)), 2)
         route[i], route[j] = route[j], route[i]
-    return route
+        return True
+    return False
 
 
 # ---------------------------
-# HGA
+# HGA (optimized)
 # ---------------------------
-def HGA(cities, generations=1000, pop_size=100):
-    population = [random.sample(range(len(cities)), len(cities)) for _ in range(pop_size)]
-    population = [two_opt(ind, cities) for ind in population]
+def HGA(cities, generations=1000, pop_size=100, workers=4):
+    n = len(cities)
+    dist = build_dist_matrix(cities)
+    candidates = build_candidates(dist, n)
+
+    # ---- parallel init ----
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        population = list(executor.map(init_worker, [(n, dist, candidates)] * pop_size))
+
+    seen = set(tuple(r) for r, _ in population)
 
     for gen in range(generations):
-        population.sort(key=lambda r: total_distance(r, cities))
+        population.sort(key=lambda x: x[1])
 
-        p1 = population[0]
-        p2 = random.choice(population)
+        p1 = population[0][0]
+        p2 = population[random.randrange(pop_size)][0]
 
-        child = crossover(p1, p2, cities)
-        child = two_opt(child, cities)
-        child = mutate(child)
+        child = crossover(p1, p2, dist, n)
 
-        if child not in population:
-            population[-1] = child
+        child, d = two_opt(child, dist, n, candidates)
+
+        mutated = mutate(child)
+
+        if mutated:
+            d = total_distance(child, dist, n)
+
+        t_child = tuple(child)
+
+        if t_child not in seen:
+            population[-1] = (child, d)
+            seen.add(t_child)
 
         if gen % 50 == 0:
-            print(f"Gen {gen}: Best Distance = {total_distance(population[0], cities):.2f}")
+            print(f"Gen {gen}: Best Distance = {population[0][1]:.2f}")
 
     return population[0]
 
@@ -137,12 +226,12 @@ def HGA(cities, generations=1000, pop_size=100):
 # MAIN
 # ---------------------------
 if __name__ == "__main__":
-    filename = input("Enter dataset file (e.g., berlin52.tsp): ")
+    file = input("Enter dataset file (e.g., berlin52.tsp): ")
+    cities = load_tsp(file)
 
-    cities = load_tsp(filename)
     print(f"Loaded {len(cities)} cities.")
 
-    best = HGA(cities)
+    best_route, best_dist = HGA(cities, workers=4)
 
-    print("\nFinal Best Distance:", total_distance(best, cities))
-    print("Best Route:", best)
+    print("\nFinal Best Distance:", best_dist)
+    print("Best Route:", best_route)
